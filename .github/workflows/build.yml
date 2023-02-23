@@ -7,13 +7,38 @@ on:
     - cron: 5 5 * * 0
 
 jobs:
+  get-version:
+      runs-on: ubuntu-latest
+      steps:
+          - name: apt install
+            run: |
+              sudo apt update
+              sudo apt install -y curl jq
+              jq --version
+          - name: Download releases
+            run: |
+              RESPONSE=$(curl \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  https://api.github.com/repos/openssl/openssl/releases)
+              URLS=$(echo $RESPONSE | jq '.[] | select(.name | startswith("OpenSSL 1")) | .assets[] | select(.name | endswith("tar.gz")) | .browser_download_url')
+              JSON=$(echo $URLS | sed s/\"//g | tr ' ' '\n' | jq -cRs 'split("\n") | map(select(length>0))')
+              echo $JSON
+              echo "json=$JSON" >> $GITHUB_ENV
+          - id: set-matrix
+            run: echo 'matrix=${{ env.json }}' >> $GITHUB_OUTPUT
+      outputs:
+          matrix: ${{ steps.set-matrix.outputs.matrix }}
+
   build-openssl:
+    needs: get-version
     strategy:
       matrix:
         mingw: [ 
           { platform: x86, bit: 32, compile: i686-w64-mingw32-, mingw: mingw }, 
           { platform: x64, bit: 64, compile: x86_64-w64-mingw32-, mingw: mingw64 }
         ]
+        openssl: ${{ fromJson(needs.get-version.outputs.matrix) }}
     runs-on: ubuntu-latest
     steps:
       - name: Set up MinGW
@@ -22,9 +47,11 @@ jobs:
           platform: ${{ matrix.mingw.platform }}
       - name: Build
         run: |
-          wget https://github.com/openssl/openssl/releases/download/OpenSSL_1_1_1t/openssl-1.1.1t.tar.gz
-          tar xzf openssl-1.1.1t.tar.gz
-          cd openssl-1.1.1t
+          wget ${{ matrix.openssl }}
+          FILENAME=$(basename ${{ matrix.openssl }})
+          tar xzf $FILENAME
+          echo "filename=$FILENAME" >> $GITHUB_ENV
+          cd $(echo $FILENAME | sed s/.tar.gz$//g)
           ./Configure ${{ matrix.mingw.mingw }} no-shared no-pinshared no-dynamic-engine no-capieng no-async --cross-compile-prefix=${{ matrix.mingw.compile }} --prefix=$GITHUB_WORKSPACE/build
           make -j 13
           make install_dev
@@ -32,29 +59,38 @@ jobs:
           tar czf openssl-mingw${{ matrix.mingw.bit }}.tar.gz lib
       - uses: actions/upload-artifact@v3
         with:
-          name: openssl-mingw${{ matrix.mingw.bit }}
+          name: ${{ env.filename }}-mingw${{ matrix.mingw.bit }}
           path: build/openssl-mingw${{ matrix.mingw.bit }}.tar.gz
 
   deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    needs: [build-openssl]
+    needs: [build-openssl, get-version]
+    strategy:
+      matrix:
+        openssl: ${{ fromJson(needs.get-version.outputs.matrix) }}
     if: github.ref == 'refs/heads/master'
     steps:
+      - name: prepare
+        run: |
+          FILENAME=$(basename ${{ matrix.openssl }})
+          echo "filename=$FILENAME" >> $GITHUB_ENV
+          NAME=$(echo $FILENAME | sed s/.tar.gz//g)
+          echo "name=$NAME" >> $GITHUB_ENV
       - uses: actions/download-artifact@v3
         with:
-          name: openssl-mingw32
+          name: ${{ env.filename }}-mingw32
           path: release
       - uses: actions/download-artifact@v3
         with:
-          name: openssl-mingw64
+          name: ${{ env.filename }}-mingw64
           path: release
       - uses: ncipollo/release-action@v1
         with:
-          name: "openssl-1.1.1t"
+          name: ${{ env.name }}
           artifacts: "release/*"
           artifactErrorsFailBuild: true
           allowUpdates: true
           commit: master
-          tag: openssl-1.1.1t
+          tag: ${{ env.name }}
